@@ -1,0 +1,18 @@
+{
+  "name": "healthcheck",
+  "description": "Report custom component health checks to the Nuon API",
+  "repo": "local:/Users/jordanacosta/projects/github.com/nuonco/nuon-ext-healthcheck",
+  "version": "dev",
+  "tag": "dev",
+  "installed_at": "2026-07-30T23:33:39Z",
+  "updated_at": "2026-07-30T23:33:39Z",
+  "binary": "",
+  "type": "script",
+  "entrypoint": "nuon-ext-healthcheck",
+  "platform": "darwin/arm64",
+  "min_cli_version": "",
+  "requires_token": true,
+  "requires_org": true,
+  "requires_app": false,
+  "requires_install": true
+}

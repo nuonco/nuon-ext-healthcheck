@@ -1,0 +1,9 @@
+[extension]
+name        = "healthcheck"
+description = "Report custom component health checks to the Nuon API"
+
+[extension.auth]
+requires_token   = true
+requires_org     = true
+requires_app     = false
+requires_install = true

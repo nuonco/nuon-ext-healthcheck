@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+#
+# nuon-ext-healthcheck — report a custom component health check to the Nuon API.
+#
+# Invoked by the Nuon CLI as `nuon healthcheck <subcommand> [flags]`. The CLI
+# injects the active context as environment variables:
+#
+#   NUON_API_URL     base URL of the ctl-api (e.g. https://api.nuon.co)
+#   NUON_ORG_ID      selected org id            -> X-Nuon-Org-ID header
+#   NUON_INSTALL_ID  selected install id        -> default for --install
+#   NUON_API_TOKEN   bearer token               -> Authorization header
+#
+# It PUTs to:
+#   {NUON_API_URL}/v1/installs/{install}/components/{component}/health/checks/{check}
+#
+set -euo pipefail
+
+readonly PROG="nuon healthcheck"
+readonly VALID_STATUSES="healthy degraded unhealthy unknown"
+# Mirror the server-side check-name rule so we fail fast with a clear message.
+readonly CHECK_NAME_RE='^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,98}[a-zA-Z0-9])?$'
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+need_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required (used to build/validate JSON safely). Install it and retry."
+}
+
+usage() {
+  cat >&2 <<EOF
+$PROG — report a custom component health check.
+
+Usage:
+  $PROG set        --component <id> --check <name> --status <status> [flags]
+  $PROG healthy    --component <id> --check <name> [flags]
+  $PROG degraded   --component <id> --check <name> [flags]
+  $PROG unhealthy  --component <id> --check <name> [flags]
+  $PROG unknown    --component <id> --check <name> [flags]
+
+Flags:
+  -c, --component <id>     component id (required)
+  -n, --check <name>       check name (required; 1-100 chars, [a-zA-Z0-9._-])
+  -s, --status <status>    one of: $VALID_STATUSES (required for 'set')
+  -m, --message <text>     human-readable message
+  -d, --details <json>     details object as a JSON string (e.g. '{"value_ms":1400}')
+      --stale-after <dur>  how long the report stays trusted (e.g. 30m; max 60m)
+  -i, --install <id>       install id (default: \$NUON_INSTALL_ID)
+      --json               print the raw API response
+  -h, --help               show this help
+
+Context (provided automatically by the Nuon CLI):
+  NUON_API_URL, NUON_ORG_ID, NUON_INSTALL_ID, NUON_API_TOKEN
+EOF
+}
+
+# ---- arg parsing --------------------------------------------------------------
+
+status=""
+component=""
+check=""
+message=""
+details=""
+stale_after=""
+install="${NUON_INSTALL_ID:-}"
+print_json=0
+
+subcommand="${1:-}"
+[ -n "$subcommand" ] || { usage; exit 2; }
+shift || true
+
+case "$subcommand" in
+  -h|--help|help) usage; exit 0 ;;
+  set) ;;
+  healthy|degraded|unhealthy|unknown) status="$subcommand" ;;
+  *) die "unknown subcommand '$subcommand' (see '$PROG --help')" ;;
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--component) component="${2:-}"; shift 2 ;;
+    -n|--check)     check="${2:-}"; shift 2 ;;
+    -s|--status)    status="${2:-}"; shift 2 ;;
+    -m|--message)   message="${2:-}"; shift 2 ;;
+    -d|--details)   details="${2:-}"; shift 2 ;;
+    --stale-after)  stale_after="${2:-}"; shift 2 ;;
+    -i|--install)   install="${2:-}"; shift 2 ;;
+    --json)         print_json=1; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    *) die "unknown flag '$1' (see '$PROG --help')" ;;
+  esac
+done
+
+# ---- validation ---------------------------------------------------------------
+
+need_jq
+
+[ -n "${NUON_API_URL:-}" ]   || die "NUON_API_URL is not set (is a Nuon context selected?)"
+[ -n "${NUON_API_TOKEN:-}" ] || die "NUON_API_TOKEN is not set (run 'nuon auth' / select a context)"
+[ -n "${NUON_ORG_ID:-}" ]    || die "NUON_ORG_ID is not set (select an org)"
+[ -n "$install" ]            || die "no install id (pass --install or select one so NUON_INSTALL_ID is set)"
+[ -n "$component" ]          || die "--component is required"
+[ -n "$check" ]              || die "--check is required"
+[ -n "$status" ]             || die "--status is required (one of: $VALID_STATUSES)"
+
+case " $VALID_STATUSES " in
+  *" $status "*) ;;
+  *) die "invalid status '$status' (must be one of: $VALID_STATUSES)" ;;
+esac
+
+[[ "$check" =~ $CHECK_NAME_RE ]] || \
+  die "invalid check name '$check' (1-100 chars of letters/digits/._- , starting and ending alphanumeric)"
+
+# details must be a JSON object if provided
+if [ -n "$details" ]; then
+  echo "$details" | jq -e 'type == "object"' >/dev/null 2>&1 || \
+    die "--details must be a JSON object, e.g. '{\"value_ms\":1400}'"
+fi
+
+# ---- build request body -------------------------------------------------------
+
+body="$(
+  jq -n \
+    --arg status "$status" \
+    --arg message "$message" \
+    --arg stale "$stale_after" \
+    --argjson details "${details:-null}" \
+    '{status: $status}
+      + (if $message != "" then {message: $message} else {} end)
+      + (if $details != null then {details: $details} else {} end)
+      + (if $stale   != "" then {stale_after: $stale} else {} end)'
+)"
+
+url="${NUON_API_URL%/}/v1/installs/${install}/components/${component}/health/checks/${check}"
+
+# ---- send ---------------------------------------------------------------------
+
+resp="$(mktemp)"
+trap 'rm -f "$resp"' EXIT
+
+code="$(
+  curl -sS -X PUT "$url" \
+    -H "Authorization: Bearer ${NUON_API_TOKEN}" \
+    -H "X-Nuon-Org-ID: ${NUON_ORG_ID}" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    -o "$resp" -w '%{http_code}'
+)"
+
+if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+  msg="$(jq -r '.error // .message // .description // empty' "$resp" 2>/dev/null || true)"
+  [ -n "$msg" ] || msg="$(cat "$resp")"
+  die "API returned HTTP $code: $msg"
+fi
+
+if [ "$print_json" -eq 1 ]; then
+  cat "$resp"
+  echo
+else
+  printf 'reported %s = %s for component %s (install %s)\n' "$check" "$status" "$component" "$install"
+fi
