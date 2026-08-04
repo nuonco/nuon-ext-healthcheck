@@ -13,9 +13,12 @@
 # Context injected by the Nuon CLI:
 #   NUON_API_URL, NUON_ORG_ID, NUON_INSTALL_ID, NUON_API_TOKEN
 #
-# Trigger-mode config (from `nuon triggers reveal-ingress-url`/`reveal-secret`):
+# Trigger-mode config. `ensure-trigger` persists the URL + secret to a sidecar
+# store ($XDG_CONFIG_HOME/nuon/healthcheck.json, 0600, keyed by org id) so the
+# reporter subcommands find them with no env setup. These override the store:
 #   NUON_HEALTH_TRIGGER_URL     ingress URL to POST events to  (or --url)
 #   NUON_HEALTH_TRIGGER_SECRET  HMAC signing secret            (or --secret)
+#   NUON_HEALTH_STORE_DIR       override the sidecar store directory
 #   NUON_HEALTH_SIG_HEADER      signature header (default X-Nuon-Signature)
 #   NUON_HEALTH_SIG_PREFIX      signature prefix (default "sha256=")
 #   NUON_HEALTH_EVENT_TYPE      event type      (default "component.health")
@@ -29,22 +32,81 @@ readonly CHECK_NAME_RE='^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,98}[a-zA-Z0-9])?$'
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not found on PATH"; }
 
+# --- sidecar config store ------------------------------------------------------
+# ensure-trigger persists the ingress URL + HMAC secret here so the reporter
+# subcommands pick them up without exported env vars. Scoped by org id (a
+# trigger is org-level). We own this file — we never touch the CLI's ~/.nuon.
+# Env vars / flags always take precedence over the store.
+store_path() {
+  local dir="${NUON_HEALTH_STORE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/nuon}"
+  printf '%s/healthcheck.json' "$dir"
+}
+
+# store_save <org> <trigger_name> <url> <secret>
+# Merges into the store; blank fields are left untouched (a re-reveal has no
+# secret, so it must not wipe a previously stored one). Written 0600, atomically.
+store_save() {
+  local org="$1" name="$2" url="$3" secret="$4" path dir tmp existing
+  [ -n "$org" ] || return 0
+  path="$(store_path)"; dir="$(dirname "$path")"
+  mkdir -p "$dir" && chmod 700 "$dir" 2>/dev/null || true
+  existing='{}'; [ -f "$path" ] && existing="$(cat "$path" 2>/dev/null || printf '{}')"
+  tmp="$(mktemp "${dir}/.healthcheck.XXXXXX")" || return 1
+  if printf '%s' "$existing" | jq \
+      --arg org "$org" --arg name "$name" --arg url "$url" --arg secret "$secret" '
+        (.[$org] // {}) as $cur
+        | .[$org] = ($cur
+            + (if $name   != "" then {trigger_name: $name} else {} end)
+            + (if $url    != "" then {url: $url}           else {} end)
+            + (if $secret != "" then {secret: $secret}     else {} end))
+      ' > "$tmp" 2>/dev/null; then
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$path"
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+
+# store_load <org> — prints "<url>\t<secret>" (tab-separated) if present.
+store_load() {
+  local org="$1" path
+  [ -n "$org" ] || return 0
+  path="$(store_path)"; [ -f "$path" ] || return 0
+  jq -r --arg org "$org" '(.[$org] // {}) | [(.url // ""), (.secret // "")] | @tsv' \
+    "$path" 2>/dev/null || true
+}
+
+# resolve_component <name-or-id> — echo the component id. A value that already
+# looks like a component id is passed through; otherwise it's treated as a
+# component name and resolved via 'nuon components list'. Dies on no/ambiguous
+# match so the caller never silently reports against the wrong component.
+resolve_component() {
+  local val="$1" matches count
+  [[ "$val" =~ ^cmp[0-9a-z]{16,}$ ]] && { printf '%s' "$val"; return 0; }
+  command -v nuon >/dev/null 2>&1 || die "can't resolve component name '$val' (nuon not on PATH); pass the id (-c cmp...)"
+  matches="$(nuon components list --output json 2>/dev/null \
+    | jq -r --arg n "$val" '(if type=="array" then . else (.components // .data // .items // []) end)[] | select(.name == $n) | .id' 2>/dev/null || true)"
+  count="$(printf '%s' "$matches" | grep -c . || true)"
+  [ "$count" = "1" ] || die "component '$val' matched ${count} components; pass the id (-c cmp...)"
+  printf '%s' "$matches"
+}
+
 usage() {
   cat >&2 <<EOF
 $PROG — report a custom component health check.
 
 Usage:
-  $PROG healthy    --component <id> --check <name> [flags]
-  $PROG degraded   --component <id> --check <name> [flags]
-  $PROG unhealthy  --component <id> --check <name> [flags]
-  $PROG unknown    --component <id> --check <name> [flags]
+  $PROG healthy    --component <name|id> [--check <name>] [flags]
+  $PROG degraded   --component <name|id> [--check <name>] [flags]
+  $PROG unhealthy  --component <name|id> [--check <name>] [flags]
+  $PROG unknown    --component <name|id> [--check <name>] [flags]
 
-  $PROG create-trigger [--name N] [--rotate] [--json]   provision the trigger (API)
+  $PROG ensure-trigger [--name N] [--rotate] [--json]   provision the trigger (API)
   $PROG generate-rule  [--trigger N] [--install ID]     emit the triggers.toml rule
 
 Flags:
-  -c, --component <id>     component id (required)
-  -n, --check <name>       check name (required; 1-100 chars, [a-zA-Z0-9._-])
+  -c, --component <name|id>  component name or id (required; names auto-resolve)
+  -n, --check <name>         check name (optional; default \$NUON_HEALTH_CHECK or "custom-healthcheck")
   -m, --message <text>     human-readable message
   -d, --details <json>     details object as a JSON string
       --via <mode>         trigger (default) | api
@@ -56,11 +118,11 @@ Flags:
 EOF
 }
 
-# do_create_trigger provisions the trigger by wrapping the built-in `nuon
+# do_ensure_trigger provisions the trigger by wrapping the built-in `nuon
 # triggers` commands (idempotent by name) and prints its ingress URL + signing
 # secret. Delegating to the CLI reuses its authenticated client and structured
 # --output json, instead of hand-rolling API requests. Does NOT touch rules.
-do_create_trigger() {
+do_ensure_trigger() {
   local name="kitchen-sink-health" rotate=0 as_json=0
   local sig_header="${NUON_HEALTH_SIG_HEADER:-X-Nuon-Signature}"
   local sig_prefix="${NUON_HEALTH_SIG_PREFIX:-sha256=}"
@@ -70,8 +132,8 @@ do_create_trigger() {
       --name)    name="${2:-}"; shift 2 ;;
       --rotate)  rotate=1; shift ;;
       --json)    as_json=1; shift ;;
-      -h|--help) echo "usage: $PROG create-trigger [--name N] [--rotate] [--json]" >&2; return 0 ;;
-      *) die "unknown create-trigger flag '$1'" ;;
+      -h|--help) echo "usage: $PROG ensure-trigger [--name N] [--rotate] [--json]" >&2; return 0 ;;
+      *) die "unknown ensure-trigger flag '$1'" ;;
     esac
   done
 
@@ -103,19 +165,24 @@ do_create_trigger() {
     fi
   fi
 
+  # Persist for the reporter subcommands (scoped by org). A re-reveal carries no
+  # secret; store_save leaves any previously stored secret intact in that case.
+  local stored_path; stored_path="$(store_path)"
+  store_save "${NUON_ORG_ID:-}" "$name" "$ingress_url" "$secret" \
+    || echo "warning: could not write ${stored_path}; falling back to env vars" >&2
+
   if [ "$as_json" = "1" ]; then
-    jq -n --arg id "$trigger_id" --arg url "$ingress_url" --arg secret "$secret" \
-      '{trigger_id:$id, ingress_url:$url, secret:$secret}'
+    jq -n --arg id "$trigger_id" --arg url "$ingress_url" --arg secret "$secret" --arg store "$stored_path" \
+      '{trigger_id:$id, ingress_url:$url, secret:$secret, stored_at:$store}'
     return 0
   fi
 
   echo "Trigger '${name}' ready (id: ${trigger_id})."
-  [ -n "$ingress_url" ] && echo "  export NUON_HEALTH_TRIGGER_URL='${ingress_url}'"
-  if [ -n "$secret" ]; then
-    echo "  export NUON_HEALTH_TRIGGER_SECRET='${secret}'   # shown once — store it now"
-  else
-    echo "  (secret only shown at create/rotate; re-run with --rotate to mint a new one)"
+  echo "Saved trigger config to ${stored_path} — used automatically by 'nuon healthcheck healthy|degraded|unhealthy|unknown'."
+  if [ -z "$secret" ]; then
+    echo "  (secret only shown at create/rotate; re-run with --rotate to mint + store a fresh one)"
   fi
+  echo "Overrides still win: NUON_HEALTH_TRIGGER_URL / NUON_HEALTH_TRIGGER_SECRET (or --url/--secret)."
   echo "Next: 'nuon healthcheck generate-rule' to emit the triggers.toml rule for your selected install."
 }
 
@@ -188,7 +255,7 @@ subcommand="${1:-}"
 shift || true
 case "$subcommand" in
   -h|--help|help) usage; exit 0 ;;
-  create-trigger) do_create_trigger "$@"; exit $? ;;
+  ensure-trigger|create-trigger) do_ensure_trigger "$@"; exit $? ;;  # create-trigger kept as a deprecated alias
   generate-rule)  do_generate_rule "$@"; exit $? ;;
   healthy|degraded|unhealthy|unknown) status="$subcommand" ;;
   *) die "unknown subcommand '$subcommand' (see '$PROG --help')" ;;
@@ -213,10 +280,13 @@ done
 need jq; need curl
 
 # --- shared validation ---------------------------------------------------------
-[ -n "$component" ] || die "--component is required"
-[ -n "$check" ]     || die "--check is required"
+[ -n "$component" ] || die "--component is required (name or id)"
+# --check is optional: falls back to $NUON_HEALTH_CHECK, then "custom-healthcheck".
+[ -n "$check" ] || check="${NUON_HEALTH_CHECK:-custom-healthcheck}"
 case " $VALID_STATUSES " in *" $status "*) ;; *) die "invalid status '$status' (must be one of: $VALID_STATUSES)" ;; esac
 [[ "$check" =~ $CHECK_NAME_RE ]] || die "invalid check name '$check' (1-100 chars, letters/digits/._- , alphanumeric ends)"
+# Accept a component name and resolve it to an id (health API/runbook need the id).
+component="$(resolve_component "$component")"
 if [ -n "$details" ]; then
   echo "$details" | jq -e 'type == "object"' >/dev/null 2>&1 || die "--details must be a JSON object"
 fi
@@ -225,8 +295,17 @@ resp="$(mktemp)"; trap 'rm -f "$resp"' EXIT
 
 case "$via" in
   trigger)
-    [ -n "$url" ]    || die "no trigger URL (set NUON_HEALTH_TRIGGER_URL or --url; get it via 'nuon triggers reveal-ingress-url')"
-    [ -n "$secret" ] || die "no trigger secret (set NUON_HEALTH_TRIGGER_SECRET or --secret; get it via 'nuon triggers reveal-secret')"
+    # Fall back to the saved sidecar config (written by ensure-trigger) when the
+    # URL/secret weren't supplied via --url/--secret or the env vars above.
+    if [ -z "$url" ] || [ -z "$secret" ]; then
+      store_line="$(store_load "${NUON_ORG_ID:-}")"
+      if [ -n "$store_line" ]; then
+        [ -z "$url" ]    && url="$(printf '%s' "$store_line" | cut -f1)"
+        [ -z "$secret" ] && secret="$(printf '%s' "$store_line" | cut -f2)"
+      fi
+    fi
+    [ -n "$url" ]    || die "no trigger URL (run 'nuon healthcheck ensure-trigger', or set NUON_HEALTH_TRIGGER_URL / --url)"
+    [ -n "$secret" ] || die "no trigger secret (run 'nuon healthcheck ensure-trigger [--rotate]', or set NUON_HEALTH_TRIGGER_SECRET / --secret)"
     need openssl
 
     event_type="${NUON_HEALTH_EVENT_TYPE:-component.health}"
@@ -237,6 +316,19 @@ case "$via" in
     # can report health for whichever install the caller targets.
     [ -n "$install" ] || die "no install id (pass --install or select one so NUON_INSTALL_ID is set)"
 
+    # A trigger rule maps payload paths into runbook inputs and can only carry
+    # SCALARS, so every mapped field must be a scalar. details rides as a JSON
+    # *string* (matching the report-health runbook's `details` string input);
+    # message defaults to "" and details to "" so each path resolves to exactly
+    # one scalar value even when the caller omits them.
+    #
+    # emitted_at + nonce make every report a UNIQUE event: the ingress dedupes
+    # on a body-derived id (ON CONFLICT DO NOTHING, still returns 2xx), so
+    # without them a repeated identical report — the normal heartbeat case,
+    # e.g. "healthy" twice in a row — would be silently dropped and never
+    # routed. Extra payload fields are ignored by rule filters/input mappings.
+    emitted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    nonce="$(openssl rand -hex 8)"
     body="$(jq -n \
       --arg event_type "$event_type" \
       --arg install "$install" \
@@ -244,10 +336,12 @@ case "$via" in
       --arg check "$check" \
       --arg status "$status" \
       --arg message "$message" \
-      --argjson details "$([ -n "$details" ] && printf '%s' "$details" || printf 'null')" \
-      '{event_type: $event_type, install: $install, component: $component, check: $check, status: $status}
-        + (if $message != "" then {message: $message} else {} end)
-        + (if $details != null then {details: $details} else {} end)')"
+      --arg details "$details" \
+      --arg emitted_at "$emitted_at" \
+      --arg nonce "$nonce" \
+      '{event_type: $event_type, install: $install, component: $component, check: $check,
+        status: $status, message: $message, details: $details,
+        emitted_at: $emitted_at, nonce: $nonce}')"
 
     # HMAC-SHA256(body, secret), hex — matches an hmac trigger configured with
     # header=X-Nuon-Signature, prefix="sha256=", encoding=hex.

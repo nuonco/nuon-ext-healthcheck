@@ -22,11 +22,17 @@ Two commands — one provisions the trigger (API), one emits the rule to sync:
 
 1. **Create the trigger** (idempotent by name; prints the ingress URL + secret):
    ```bash
-   nuon healthcheck create-trigger            # human-readable
-   nuon healthcheck create-trigger --json     # for stashing the secret
-   nuon healthcheck create-trigger --rotate   # mint a fresh secret on an existing trigger
+   nuon healthcheck ensure-trigger            # human-readable
+   nuon healthcheck ensure-trigger --json     # machine-readable
+   nuon healthcheck ensure-trigger --rotate   # mint a fresh secret on an existing trigger
    ```
-   The secret is only shown at create/rotate. Then export what it prints:
+   `ensure-trigger` **saves the URL + secret** to a per-org sidecar store
+   (`$XDG_CONFIG_HOME/nuon/healthcheck.json`, mode `0600`), so the reporter
+   subcommands below just work with no further setup — no exports needed.
+
+   The secret is only shown/stored at create/rotate. To override the store
+   (CI, another shell) you can still pass them explicitly — env vars and
+   `--url/--secret` always win over the store:
    ```bash
    export NUON_HEALTH_TRIGGER_URL='https://.../v1/event-ingress/<key>'
    export NUON_HEALTH_TRIGGER_SECRET='<secret>'
@@ -55,11 +61,11 @@ install you want to cover.
 ## Usage
 
 ```bash
-nuon healthcheck degraded \
-  --component cmp43ei... --check my-check \
+# Component may be a NAME (auto-resolved to its id) or a raw cmp… id.
+# --check is optional; message/details are optional too.
+nuon healthcheck healthy   --component kitchen_sink
+nuon healthcheck degraded  --component kitchen_sink --check p99-latency \
   --message "p99 above SLO" --details '{"value_ms":1400}'
-
-nuon healthcheck healthy --component cmp... --check my-check
 ```
 
 The status is the subcommand: `healthy` | `degraded` | `unhealthy` | `unknown`.
@@ -68,8 +74,8 @@ The status is the subcommand: `healthy` | `degraded` | `unhealthy` | `unknown`.
 
 | Flag | Description |
 |------|-------------|
-| `-c, --component` | Component id (required) |
-| `-n, --check` | Check name (required; 1–100 chars, `[a-zA-Z0-9._-]`) |
+| `-c, --component` | Component **name or id** (required; a name is resolved to its id via `nuon components list`) |
+| `-n, --check` | Check name (optional; default `$NUON_HEALTH_CHECK`, else `custom-healthcheck`; 1–100 chars, `[a-zA-Z0-9._-]`) |
 | `-m, --message` | Human-readable message |
 | `-d, --details` | Details object as a JSON string |
 | `--via` | `trigger` (default) or `api` |
@@ -81,10 +87,16 @@ The status is the subcommand: `healthy` | `degraded` | `unhealthy` | `unknown`.
 ## Environment
 
 - Injected by the CLI: `NUON_API_URL`, `NUON_ORG_ID`, `NUON_INSTALL_ID`, `NUON_API_TOKEN`.
+- `NUON_HEALTH_CHECK`: default check name when `--check` is omitted (else `custom-healthcheck`).
 - Trigger mode: `NUON_HEALTH_TRIGGER_URL`, `NUON_HEALTH_TRIGGER_SECRET`, and
   optionally `NUON_HEALTH_SIG_HEADER` (default `X-Nuon-Signature`),
   `NUON_HEALTH_SIG_PREFIX` (default `sha256=`), `NUON_HEALTH_EVENT_TYPE`
   (default `component.health`).
+- Sidecar store: `ensure-trigger` writes the URL + secret to
+  `$XDG_CONFIG_HOME/nuon/healthcheck.json` (default `~/.config/nuon/...`, mode
+  `0600`, keyed by org id); reporters read it when the env vars/flags are unset.
+  Set `NUON_HEALTH_STORE_DIR` to relocate it. The CLI's own `~/.nuon` is never
+  touched.
 
 ## Requirements
 
