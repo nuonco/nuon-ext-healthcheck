@@ -1,9 +1,12 @@
 [extension]
 name        = "healthcheck"
-description = "Report custom component health checks to the Nuon API"
+description = "Report custom component health checks to a Nuon trigger (or the API directly)"
 
 [extension.auth]
 requires_token   = true
 requires_org     = true
 requires_app     = false
-requires_install = true
+# --via trigger (default) posts to a trigger ingress URL and does not need an
+# install selected. --via api falls back to the direct health-check API, which
+# does require an install.
+requires_install = false
