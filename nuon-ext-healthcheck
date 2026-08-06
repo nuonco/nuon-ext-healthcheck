@@ -19,6 +19,9 @@ readonly CHECK_NAME_RE='^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,98}[a-zA-Z0-9])?$'
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not found on PATH"; }
 
+# shq — single-quote an argument for safe reuse in a copy-pasted shell command.
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
 # resolve_component <name-or-id> — echo the component id. A value that already
 # looks like a component id is passed through; otherwise it's treated as a
 # component name and resolved via 'nuon components list'. Dies on no/ambiguous
@@ -51,12 +54,13 @@ Flags:
   -d, --details <json>       details object as a JSON string
   -i, --install <id>         install id (default \$NUON_INSTALL_ID)
       --json                 print the raw response
+      --curl                 print the equivalent curl command instead of sending
   -h, --help                 show this help
 EOF
 }
 
 status=""; component=""; check=""; message=""; details=""
-install="${NUON_INSTALL_ID:-}"; print_json=0
+install="${NUON_INSTALL_ID:-}"; print_json=0; print_curl=0
 
 subcommand="${1:-}"
 [ -n "$subcommand" ] || { usage; exit 2; }
@@ -75,6 +79,7 @@ while [ $# -gt 0 ]; do
     -d|--details)   details="${2:-}"; shift 2 ;;
     -i|--install)   install="${2:-}"; shift 2 ;;
     --json)         print_json=1; shift ;;
+    --curl)         print_curl=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     *) die "unknown flag '$1' (see '$PROG --help')" ;;
   esac
@@ -99,16 +104,29 @@ fi
 [ -n "${NUON_ORG_ID:-}" ]    || die "NUON_ORG_ID is not set"
 [ -n "$install" ]            || die "no install id (pass --install or select one)"
 
-resp="$(mktemp)"; trap 'rm -f "$resp"' EXIT
-
 body="$(jq -n --arg status "$status" --arg message "$message" \
   --argjson details "$([ -n "$details" ] && printf '%s' "$details" || printf 'null')" \
   '{status: $status}
     + (if $message != "" then {message: $message} else {} end)
     + (if $details != null then {details: $details} else {} end)')"
 
-code="$(curl -sS -X PUT \
-  "${NUON_API_URL%/}/v1/installs/${install}/components/${component}/health/checks/${check}" \
+url="${NUON_API_URL%/}/v1/installs/${install}/components/${component}/health/checks/${check}"
+
+# --curl: print a copy-pasteable request instead of sending. The token and org
+# are emitted as env-var references (not literals) so the secret never lands in
+# terminal scrollback; they expand when the command is run in this same shell.
+if [ "$print_curl" -eq 1 ]; then
+  printf 'curl -X PUT %s \\\n' "$(shq "$url")"
+  printf '  -H "Authorization: Bearer $NUON_API_TOKEN" \\\n'
+  printf '  -H "X-Nuon-Org-ID: $NUON_ORG_ID" \\\n'
+  printf '  -H %s \\\n' "$(shq 'Content-Type: application/json')"
+  printf '  -d %s\n' "$(shq "$body")"
+  exit 0
+fi
+
+resp="$(mktemp)"; trap 'rm -f "$resp"' EXIT
+
+code="$(curl -sS -X PUT "$url" \
   -H "Authorization: Bearer ${NUON_API_TOKEN}" \
   -H "X-Nuon-Org-ID: ${NUON_ORG_ID}" \
   -H "Content-Type: application/json" \

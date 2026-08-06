@@ -41,6 +41,7 @@ The install defaults to the selected install (`NUON_INSTALL_ID`); pass
 | `-d, --details` | Details object as a JSON string |
 | `-i, --install` | Install id (defaults to selected install) |
 | `--json` | Print the raw response |
+| `--curl` | Print the equivalent `curl` command instead of sending (token/org emitted as `$NUON_API_TOKEN`/`$NUON_ORG_ID` refs, not literals) |
 
 ## Environment
 
