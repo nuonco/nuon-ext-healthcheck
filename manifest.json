@@ -1,6 +1,6 @@
 {
   "name": "healthcheck",
-  "description": "Report custom component health checks to the Nuon API",
+  "description": "Report custom component health checks directly to the Nuon API",
   "repo": "local:/Users/jordanacosta/projects/github.com/nuonco/nuon-ext-healthcheck",
   "version": "dev",
   "tag": "dev",
@@ -14,5 +14,5 @@
   "requires_token": true,
   "requires_org": true,
   "requires_app": false,
-  "requires_install": false
+  "requires_install": true
 }
